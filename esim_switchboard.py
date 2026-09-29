@@ -608,6 +608,36 @@ class PaymentUnavailable(Exception):
     pass
 
 
+DIAGNOSTIC_REVISION = "20260929-diagnostics12"
+
+
+class PaymentPreflightUnavailable(Exception):
+    def __init__(self, order_id, stage, code):
+        self.order_id, self.stage, self.code = order_id, stage, code
+        super().__init__(code)
+
+
+def preflight_failure_code(stage, exc):
+    """Bounded diagnostic codes only: never expose upstream bodies or credentials."""
+    import re
+    cause = exc
+    for _ in range(4):
+        if isinstance(cause, httpx.HTTPStatusError):
+            return f"{stage}_http_{cause.response.status_code}"
+        if isinstance(cause, httpx.TimeoutException):
+            return f"{stage}_timeout"
+        if isinstance(cause, httpx.RequestError):
+            return f"{stage}_connection_error"
+        cause = cause.__cause__
+        if cause is None: break
+    if isinstance(exc, ProviderRejected):
+        code = exc.code if re.fullmatch(r"[a-zA-Z0-9_]{1,40}", exc.code) else "unknown"
+        return f"{stage}_rejected_{code}"
+    known = {"insufficient_supplier_balance", "facilitator_network_not_supported", "malformed_catalog"}
+    if str(exc) in known: return str(exc)
+    return f"{stage}_unavailable"
+
+
 DISCOVERY_REVISION = "20260929-bazaar11"
 RESOURCE_DESCRIPTION = (
     "CryptoEsim: buy a travel eSIM or compatible data top-up with Algorand USDC; "
@@ -737,11 +767,13 @@ class LiveGateway:
         return inspect_avm_payload(payload, requirements, url, self.settings.mode)
 
     def _post(self, endpoint, payload, requirements):
+        stage = "facilitator_" + endpoint.strip("/")
         try:
             # Current SDK uses CAIP-2 (32 chars). Some facilitators still register
             # the full genesis hash. Negotiate only these two equivalent aliases;
             # never change signed bytes, amount, asset, destination or resource.
             if self._facilitator_network is None or time.monotonic() - self._network_checked_at > 600:
+                stage = "facilitator_supported"
                 supported = self.http.get(self.settings.facilitator_url.rstrip("/") + "/supported")
                 supported.raise_for_status()
                 networks = {kind.get("network") for kind in supported.json().get("kinds", [])
@@ -751,6 +783,7 @@ class LiveGateway:
                 if network is None: raise PaymentUnavailable("facilitator_network_not_supported")
                 self._facilitator_network = network
                 self._network_checked_at = time.monotonic()
+            stage = "facilitator_" + endpoint.strip("/")
             outgoing_requirements = {**requirements, "network": self._facilitator_network}
             # Attach authoritative discovery metadata even for older/API clients
             # that omit it. Only wrapper metadata changes, never signed bytes or price.
@@ -770,7 +803,9 @@ class LiveGateway:
                 raise ValueError("Invalid response")
             return obj
         except (httpx.HTTPError, ValueError) as exc:
-            raise PaymentUnavailable("facilitator_unavailable") from exc
+            failure = PaymentUnavailable("facilitator_unavailable")
+            failure.stage = stage
+            raise failure from exc
 
     def verify(self, payload, requirements, identity):
         result = self._post("/verify", payload, requirements)
@@ -984,28 +1019,37 @@ class Service:
             claim = str(uuid.uuid4())
             if not self.store.change(row["id"], ["quoted"], {"status": "verifying", "claim": claim}): return self.store.get(row["id"])
             q = json.loads(row["quote_json"]); req = json.loads(row["request_json"])
+            stage = "facilitator_verify"
             try:
                 payload = decode_header(raw)
                 identity = self.gateway.inspect(payload, q["terms"], q["resource_url"])
                 self.gateway.verify(payload, q["terms"], identity)
+                stage = "provider_catalog"
                 iccid = self.parent_profile(self.store.get(row["parent_id"]))[1] if row["parent_id"] else None
                 current = [p for p in self.provider.plans(req["country"], iccid, fresh=True) if p["id"] == q["plan"]["id"]]
                 if len(current) != 1 or digest(current[0]) != digest(q["plan"]):
                     self.store.change(row["id"], ["verifying"], {"status": "expired", "error_code": "catalog_changed_before_payment"}, claim)
                     return self.store.get(row["id"])
+                stage = "provider_balance"
                 if self.provider.balance() < q["plan"]["cost_units"]: raise ProviderUnavailable("insufficient_supplier_balance")
                 if now_ms() > row["expires_ms"]:
                     self.store.change(row["id"], ["verifying"], {"status": "expired"}, claim); return self.store.get(row["id"])
                 if not self.store.change(row["id"], ["verifying"], {"status": "prepared", "payment_payload": self.vault.seal(payload),
-                        "payment_id": identity.transaction_id, "payer": identity.payer, "claim": None}, claim):
+                        "payment_id": identity.transaction_id, "payer": identity.payer, "claim": None, "error_code": None}, claim):
                     raise InvalidPayment("payment_already_used")
                 self.store.audit(row["id"], "signed_payment_persisted")
             except (InvalidPayment, ValueError, TypeError):
                 self.store.change(row["id"], ["verifying"], {"status": "quoted", "error_code": "invalid_payment", "claim": None}, claim)
                 raise HTTPException(400, "Pago inválido o ya utilizado. Conserva el estado del pedido.")
-            except (ProviderUnavailable, ProviderRejected, PaymentUnavailable):
-                self.store.change(row["id"], ["verifying"], {"status": "quoted", "error_code": "preflight_unavailable", "claim": None}, claim)
-                raise HTTPException(503, "No se ha enviado el pago; recupera este mismo pedido")
+            except (ProviderUnavailable, ProviderRejected, PaymentUnavailable) as exc:
+                import logging
+                stage = getattr(exc, "stage", stage)
+                code = preflight_failure_code(stage, exc)
+                self.store.change(row["id"], ["verifying"], {"status": "quoted", "error_code": code, "claim": None}, claim)
+                logging.getLogger("cryptoesim").warning(
+                    "payment_preflight_failed order=%s stage=%s code=%s payment_submitted=false",
+                    row["id"], stage, code)
+                raise PaymentPreflightUnavailable(row["id"], stage, code) from None
             row = self.store.get(row["id"])
         return self.advance(row)
 
@@ -1230,6 +1274,12 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
             "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https: wss:; frame-src https:; object-src 'none'; base-uri 'none'; form-action 'self'"})
         return response
 
+    @app.exception_handler(PaymentPreflightUnavailable)
+    async def payment_preflight_unavailable(_, exc):
+        return JSONResponse({"detail": "No se ha enviado el pago en este intento; recupera este mismo pedido.",
+                             "order_id": exc.order_id, "code": exc.code, "stage": exc.stage,
+                             "payment_submitted": False, "next_action": "recover_same_order"}, 503)
+
     @app.exception_handler(ProviderUnavailable)
     async def unavailable(_, exc): return JSONResponse({"detail": "El proveedor no está disponible. Conserva tu pedido y reintenta la consulta."}, 503)
     @app.exception_handler(ProviderRejected)
@@ -1285,6 +1335,7 @@ h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style>
                 "algod_url": cfg.node_url if cfg.mode != "demo" else None, "signing_key": service.signer.public_document(),
                 "delivery_refresh": True,
                 "discovery_revision": DISCOVERY_REVISION,
+                "diagnostic_revision": DIAGNOSTIC_REVISION,
                 "terms_version": "cryptoesim-1", "usage_delay_hours": "2–3"}
     @app.get("/api/plans")
     def plans(country: str = "ES"):
