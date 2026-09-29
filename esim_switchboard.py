@@ -608,7 +608,7 @@ class PaymentUnavailable(Exception):
     pass
 
 
-DIAGNOSTIC_REVISION = "20260929-diagnostics12"
+DIAGNOSTIC_REVISION = "20260929-diagnostics13"
 
 
 class PaymentPreflightUnavailable(Exception):
@@ -1003,6 +1003,52 @@ class Service:
                 logging.getLogger("cryptoesim").warning("delivery_check order=%s code=%s", row["id"], code)
         return self.store.get(row["id"])
 
+    def diagnostics(self, row):
+        """Authenticated current checks. Never verify/settle, issue, resume or write an order."""
+        from concurrent.futures import ThreadPoolExecutor
+        q = json.loads(row["quote_json"]); req = json.loads(row["request_json"])
+        result = {"order_id": row["id"], "diagnostic_revision": DIAGNOSTIC_REVISION,
+                  "historical_error": row["error_code"], "checked_ms": now_ms(),
+                  "quote_expired": now_ms() > row["expires_ms"], "read_only": True,
+                  "checks": {"sales": {"ok": self.cfg.mode != "mainnet" or self.cfg.sales_enabled,
+                                       "code": "sales_open" if self.cfg.mode != "mainnet" or self.cfg.sales_enabled else "sales_paused"}}}
+        if self.cfg.mode == "demo":
+            result["checks"]["dependencies"] = {"ok": True, "code": "simulated_checks"}
+            return result
+
+        def facilitator_supported():
+            response = self.gateway.http.get(self.cfg.facilitator_url.rstrip("/") + "/supported")
+            response.raise_for_status()
+            kinds = response.json().get("kinds", [])
+            aliases = (self.cfg.network, "algorand:" + GENESIS[self.cfg.mode])
+            supported = any(k.get("scheme") == "exact" and k.get("x402Version") == 2
+                            and k.get("network") in aliases for k in kinds)
+            return {"ok": supported, "code": "facilitator_supported" if supported else "facilitator_network_not_supported"}
+
+        def provider_catalog():
+            iccid = self.parent_profile(self.store.get(row["parent_id"]))[1] if row["parent_id"] else None
+            current = [p for p in self.provider.plans(req["country"], iccid, fresh=True) if p["id"] == q["plan"]["id"]]
+            matches = len(current) == 1 and digest(current[0]) == digest(q["plan"])
+            return {"ok": matches, "code": "catalog_matches_saved_quote" if matches else "catalog_changed_before_payment"}
+
+        def provider_balance():
+            enough = self.provider.balance() >= q["plan"]["cost_units"]
+            return {"ok": enough, "code": "supplier_balance_sufficient" if enough else "insufficient_supplier_balance"}
+
+        def check(item):
+            stage, action = item
+            try: value = action()
+            except Exception as exc: value = {"ok": False, "code": preflight_failure_code(stage, exc)}
+            return stage, value
+
+        # Independent read calls run together so one diagnostic stays within the client timeout.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for stage, value in pool.map(check, (("facilitator_supported", facilitator_supported),
+                                               ("provider_catalog", provider_catalog),
+                                               ("provider_balance", provider_balance))):
+                result["checks"][stage] = value
+        return result
+
     def pay(self, row, raw):
         if row["status"] == "completed": return row
         if row["status"] in ("expired", "refund_required", "refunding", "refunded", "needs_review"): return row
@@ -1362,6 +1408,9 @@ h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style>
         return pay(oid, request)
     @app.get("/api/orders/{oid}")
     def get_order(oid: str, request: Request): return order_response(own(oid, request))
+    @app.get("/api/orders/{oid}/diagnostics")
+    def order_diagnostics(oid: str, request: Request):
+        return service.diagnostics(own(oid, request))
     @app.post("/api/orders/{oid}/delivery")
     def refresh_delivery(oid: str, request: Request):
         row = own(oid, request)
