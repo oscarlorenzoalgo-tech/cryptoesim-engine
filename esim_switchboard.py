@@ -608,6 +608,80 @@ class PaymentUnavailable(Exception):
     pass
 
 
+DISCOVERY_REVISION = "20260929-bazaar11"
+RESOURCE_DESCRIPTION = (
+    "CryptoEsim: buy a travel eSIM or compatible data top-up with Algorand USDC; "
+    "retrieve delivery and a signed receipt using the same private order."
+)
+
+
+def discovery_extensions(cfg):
+    """Server-owned V2 metadata; POST is declared in both info and JSON Schema."""
+    example_id = "00000000-0000-4000-8000-000000000000"
+    tags = (["x402-global-challenge"] if cfg.mode == "mainnet" else []) + ["esim", "travel", "connectivity"]
+    return {
+        "bazaar": {
+            "info": {
+                "name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "tags": tags,
+                "input": {"type": "http", "method": "POST", "bodyType": "json", "body": {"order_id": example_id}},
+                "output": {"type": "json", "example": {"order_id": example_id, "status": "issuing",
+                                                       "next_action": "recover_same_order"}},
+            },
+            "schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                "properties": {
+                    "name": {"type": "string"}, "description": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "input": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "const": "http"},
+                            "method": {"type": "string", "enum": ["POST"]},
+                            "bodyType": {"type": "string", "enum": ["json"]},
+                            "body": {"type": "object", "properties": {"order_id": {
+                                "type": "string", "description": "Order UUID returned by POST /api/orders",
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"}},
+                                "required": ["order_id"], "additionalProperties": False},
+                        },
+                        "required": ["type", "method", "bodyType", "body"], "additionalProperties": False,
+                    },
+                    "output": {"type": "object", "properties": {"type": {"type": "string", "enum": ["json"]},
+                        "example": {"type": "object", "properties": {"order_id": {"type": "string"},
+                            "status": {"type": "string"}, "next_action": {"type": "string"}},
+                            "required": ["order_id", "status"]}}, "required": ["type", "example"]},
+                },
+                "required": ["input"],
+            },
+        },
+        "x402-merchant": {
+            "info": {"name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "url": cfg.public_url},
+            "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                       "properties": {"name": {"type": "string"}, "description": {"type": "string"},
+                                      "url": {"type": "string"}}, "required": ["name"]},
+        },
+    }
+
+
+def discovery_document(cfg):
+    """Public description, NOT a payable quote: prices depend on the selected plan."""
+    return {
+        "name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "url": cfg.public_url,
+        "x402Version": 2, "revision": DISCOVERY_REVISION,
+        "resource": {"url": cfg.public_url + "/api/pay", "description": RESOURCE_DESCRIPTION,
+                     "mimeType": "application/json"},
+        "resources": [cfg.public_url + "/api/pay"], "extensions": discovery_extensions(cfg),
+        "payment": {"scheme": "exact", "network": cfg.network, "asset": cfg.asset, "payTo": cfg.pay_to,
+                    "extra": {"decimals": 6, **({"tag": "x402-global-challenge"} if cfg.mode == "mainnet" else {})},
+                    "pricing": "Order-specific: use the exact amount from the authenticated HTTP 402 quote."},
+        "flow": {"catalog": "GET /api/plans?country=ES", "create_order": "POST /api/orders",
+                 "pay": "POST /api/pay", "authorization": "Bearer recovery token for the selected order",
+                 "delivery": "GET /api/orders/{order_id}",
+                 "instructions": "Create an order after accepting the terms and checking device compatibility. "
+                     "Keep its recovery token private. Request the 402 quote, sign its exact payment terms, "
+                     "then retry POST /api/pay with PAYMENT-SIGNATURE. Recover paid orders without paying again."},
+    }
+
+
 @dataclass
 class PaymentIdentity:
     transaction_id: str
@@ -678,7 +752,14 @@ class LiveGateway:
                 self._facilitator_network = network
                 self._network_checked_at = time.monotonic()
             outgoing_requirements = {**requirements, "network": self._facilitator_network}
-            outgoing_payload = {**payload, "accepted": {**payload["accepted"], "network": self._facilitator_network}}
+            # Attach authoritative discovery metadata even for older/API clients
+            # that omit it. Only wrapper metadata changes, never signed bytes or price.
+            extensions = payload.get("extensions")
+            outgoing_payload = {**payload, "accepted": outgoing_requirements,
+                "resource": {**payload.get("resource", {}), "description": RESOURCE_DESCRIPTION,
+                             "mimeType": "application/json"},
+                "extensions": {**(extensions if isinstance(extensions, dict) else {}),
+                               **discovery_extensions(self.settings)}}
             response = self.http.post(self.settings.facilitator_url + endpoint,
                                       json={"x402Version": payload.get("x402Version", 2),
                                             "paymentPayload": outgoing_payload, "paymentRequirements": outgoing_requirements},
@@ -848,10 +929,8 @@ class Service:
     def challenge(self, row):
         q = json.loads(row["quote_json"])
         return {"x402Version": 2, "resource": {"url": q["resource_url"], "mimeType": "application/json",
-                    "description": "Purchase mobile eSIM data or a compatible top-up; retrieve the same order without repaying."},
-                "accepts": [q["terms"]], "extensions": {"bazaar": {"info": {"input": {"type": "http", "method": "POST", "bodyType": "json", "body": {"order_id": "UUID from POST /api/orders"}},
-                    "output": {"type": "json", "example": {"status": "completed", "delivery": {"activation_code": "private eSIM code"}}}},
-                    "schema": {"type": "object", "properties": {"input": {"type": "object"}, "output": {"type": "object"}}, "required": ["input"]}}}}
+                    "description": RESOURCE_DESCRIPTION},
+                "accepts": [q["terms"]], "extensions": discovery_extensions(self.cfg)}
 
     def view(self, row):
         if row["result"]:
@@ -1078,10 +1157,11 @@ import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
@@ -1170,9 +1250,25 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
         return JSONResponse(obj, code, headers=headers)
 
     @app.get("/")
-    def home():
+    def home(request: Request):
         if (WEB / "cryptoesim.html").is_file(): return FileResponse(WEB / "cryptoesim.html")
-        return {"service": "CryptoEsim API", "health": "/health"}
+        if "application/json" in request.headers.get("Accept", ""):
+            return {"service": "CryptoEsim API", "health": "/health", "discovery": "/.well-known/x402.json"}
+        name, description = escape(cfg.merchant_name), escape(RESOURCE_DESCRIPTION)
+        api, storefront = escape(cfg.public_url, quote=True), escape(cfg.store_origin or cfg.public_url, quote=True)
+        return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{name}</title>
+<meta name="application-name" content="{name}"><meta name="description" content="{description}">
+<meta property="og:site_name" content="{name}"><meta property="og:title" content="{name}">
+<meta property="og:description" content="{description}"><meta property="og:type" content="website">
+<meta property="og:url" content="{api}/"><link rel="canonical" href="{api}/">
+<link rel="describedby" type="application/json" href="{api}/.well-known/x402.json">
+<style>body{{background:#100e11;color:#f8f6f7;font:18px system-ui;margin:10vh auto;padding:24px;max-width:720px}}
+h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style></head>
+<body><h1>{name}</h1><p>{description}</p><p><a href="{storefront}">Open CryptoEsim store</a></p>
+<p><a href="/.well-known/x402.json">API discovery</a> · <a href="/health">Service health</a></p></body></html>''')
+    @app.get("/.well-known/x402.json")
+    def discovery(): return discovery_document(cfg)
     @app.get("/docs")
     def api_docs(): return {"paid_resource": cfg.public_url + "/api/pay", "catalog": "/api/plans", "orders": "/api/orders"}
     @app.get("/health")
@@ -1188,6 +1284,7 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
                 "countries": cfg.allowed_countries, "merchant_name": cfg.merchant_name, "support_email": cfg.support_email,
                 "algod_url": cfg.node_url if cfg.mode != "demo" else None, "signing_key": service.signer.public_document(),
                 "delivery_refresh": True,
+                "discovery_revision": DISCOVERY_REVISION,
                 "terms_version": "cryptoesim-1", "usage_delay_hours": "2–3"}
     @app.get("/api/plans")
     def plans(country: str = "ES"):
