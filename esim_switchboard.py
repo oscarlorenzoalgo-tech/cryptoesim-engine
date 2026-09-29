@@ -511,10 +511,12 @@ class ESIMAccess:
         elif order_no: body["orderNo"] = order_no
         else: raise ValueError("profile identifier required")
         obj = self.post("/esim/query", body)
-        rows = obj.get("esimList", [])
+        rows = obj.get("esimList")
+        if not isinstance(rows, list): raise ProviderUnavailable("malformed_profile_response")
         if not rows: return None
         if len(rows) != 1: raise ProviderUnavailable("ambiguous_profile")
         p = rows[0]
+        if not isinstance(p, dict): raise ProviderUnavailable("malformed_profile_response")
         if (profile_id and p.get("esimTranNo") != profile_id) or (order_no and p.get("orderNo") != order_no):
             raise ProviderUnavailable("provider_profile_mismatch")
         return p
@@ -855,7 +857,30 @@ class Service:
                 "pricing": public_price(q["pricing"]), "expires_ms": row["expires_ms"], "error_code": row["error_code"],
                 "payment": json.loads(row["payment_json"]) if row["payment_json"] else None,
                 "refund_transaction": row["refund_tx"], "support_email": self.cfg.support_email,
+                "fulfillment": self.fulfillment(row),
                 "next_action": "recover_same_order" if row["status"] not in ("quoted", "expired") else "quote_or_pay"}
+
+    def fulfillment(self, row):
+        # Authenticated order responses only. Never include credentials or activation codes here.
+        history = self.store.history(row["id"]) if row["payment_json"] else []
+        accepted = next((e["at_ms"] for e in history if e["event"] == "provider_order_accepted"), None)
+        paid = next((e["at_ms"] for e in history if e["event"] == "payment_confirmed"), None)
+        started = accepted or paid
+        return {"provider_order": row["provider_order"], "provider_transaction": row["provider_transaction"],
+                "provider_accepted_ms": accepted, "payment_confirmed_ms": paid,
+                "expected_provider_seconds": 30, "delayed": bool(started and now_ms() - started > 120000),
+                "error_code": row["error_code"]}
+
+    def delivery_issue(self, row, code):
+        # Persist a bounded machine-readable code; never log provider bodies, keys or LPA codes.
+        import logging
+        import re
+        code = code if re.fullmatch(r"[a-zA-Z0-9_]{1,90}", code) else "provider_unavailable"
+        if row["error_code"] != code:
+            if self.store.change(row["id"], ["issuing"], {"error_code": code}):
+                self.store.audit(row["id"], "delivery_check_" + code[:60])
+                logging.getLogger("cryptoesim").warning("delivery_check order=%s code=%s", row["id"], code)
+        return self.store.get(row["id"])
 
     def pay(self, row, raw):
         if row["status"] == "completed": return row
@@ -948,10 +973,12 @@ class Service:
             if self.store.change(oid, ["ordering"], {"claim": claim}, row["claim"]): return self.submit_provider(self.store.get(oid))
         if row["status"] == "issuing":
             try:
+                if not row["provider_order"]: return self.delivery_issue(row, "missing_provider_order")
                 p = self.provider.profile(order_no=row["provider_order"])
                 if p:
                     if p.get("transactionId") not in (None, row["provider_transaction"]): raise ProviderUnavailable("provider_identity_mismatch")
-                    if not p.get("esimTranNo") or not p.get("iccid") or not p.get("ac"): return row
+                    if not p.get("esimTranNo") or not p.get("iccid") or not p.get("ac"):
+                        return self.delivery_issue(row, "provider_profile_incomplete")
                     if not self.cfg.simulation and not p["ac"].startswith("LPA:1$"): raise ProviderUnavailable("invalid_activation_code")
                     plan = json.loads(row["quote_json"])["plan"]
                     if int(p.get("totalVolume", 0)) < plan["volume_bytes"] or int(p.get("totalDuration", 0)) < plan["duration_days"]:
@@ -963,7 +990,13 @@ class Service:
                         "total_bytes": int(p["totalVolume"]), "duration_days": p.get("totalDuration"),
                         "expires_at": p.get("expiredTime"), "simulation": self.cfg.simulation}
                     return self.finish(row, delivery)
-            except (ProviderUnavailable, ProviderRejected): pass
+                return self.delivery_issue(row, "provider_profile_pending")
+            except ProviderRejected as exc:
+                return self.delivery_issue(row, "provider_" + exc.code)
+            except ProviderUnavailable as exc:
+                return self.delivery_issue(row, str(exc))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                return self.delivery_issue(row, "malformed_profile_response")
         return self.store.get(oid)
 
     def submit_provider(self, row):
@@ -973,6 +1006,8 @@ class Service:
                 number = self.provider.order(row["provider_transaction"], q["plan"])
                 self.store.change(oid, ["ordering"], {"status": "issuing", "provider_order": number, "claim": None, "error_code": None}, row["claim"])
                 self.store.audit(oid, "provider_order_accepted")
+                import logging
+                logging.getLogger("cryptoesim").warning("provider_order_accepted order=%s", oid)
                 return self.advance(self.store.get(oid))
             parent = self.store.get(row["parent_id"])
             profile, iccid = self.parent_profile(parent)
@@ -991,6 +1026,11 @@ class Service:
                 self.store.audit(oid, "refund_required")
             elif req["kind"] == "topup":
                 self.store.change(oid, ["ordering"], {"status": "needs_review", "error_code": "topup_outcome_unknown"}, row["claim"])
+            else:
+                code = exc.code if exc.code.isdecimal() and len(exc.code) <= 12 else "unknown"
+                self.store.change(oid, ["ordering"], {"error_code": "provider_" + code}, row["claim"])
+            import logging
+            logging.getLogger("cryptoesim").warning("provider_order_failed order=%s code=%s", oid, self.store.get(oid)["error_code"])
         except (ProviderUnavailable, ValueError, TypeError, KeyError):
             if req["kind"] == "topup":
                 self.store.change(oid, ["ordering"], {"status": "needs_review", "error_code": "topup_outcome_unknown"}, row["claim"])
@@ -1140,6 +1180,7 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
                 "simulation": cfg.simulation, "sales_enabled": cfg.mode != "mainnet" or cfg.sales_enabled,
                 "countries": cfg.allowed_countries, "merchant_name": cfg.merchant_name, "support_email": cfg.support_email,
                 "algod_url": cfg.node_url if cfg.mode != "demo" else None, "signing_key": service.signer.public_document(),
+                "delivery_refresh": True,
                 "terms_version": "cryptoesim-1", "usage_delay_hours": "2–3"}
     @app.get("/api/plans")
     def plans(country: str = "ES"):
@@ -1166,6 +1207,13 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
         return pay(oid, request)
     @app.get("/api/orders/{oid}")
     def get_order(oid: str, request: Request): return order_response(own(oid, request))
+    @app.post("/api/orders/{oid}/delivery")
+    def refresh_delivery(oid: str, request: Request):
+        row = own(oid, request)
+        # Only query an already-created supplier order. Never settle a payment or create an eSIM.
+        if row["status"] == "issuing" and row["payment_json"] and row["provider_order"]:
+            row = service.advance(row)
+        return order_response(row)
     @app.post("/api/orders/{oid}/resume")
     def resume(oid: str, request: Request): return order_response(service.advance(own(oid, request)))
     @app.get("/api/orders/{oid}/events")
