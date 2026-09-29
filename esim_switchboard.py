@@ -454,8 +454,9 @@ class ProviderRejected(Exception):
 
 def normalize(p):
     if p.get("currencyCode") != "USD" or p.get("dataType") != 1 or p.get("durationUnit") != "DAY": return None
-    required = ("slug", "price", "volume", "duration", "location", "activeType")
+    required = ("slug", "packageCode", "price", "volume", "duration", "location", "activeType")
     if any(p.get(k) is None for k in required): return None
+    if not isinstance(p["packageCode"], str) or not p["packageCode"].strip(): return None
     if type(p["price"]) is not int or p["price"] <= 0 or type(p["volume"]) is not int or p["volume"] <= 0: return None
     if not isinstance(p["duration"], int) or p["duration"] <= 0 or p["activeType"] not in (1, 2): return None
     return {"id": str(p["slug"]), "name": str(p.get("name", p["slug"])), "cost_units": p["price"],
@@ -499,9 +500,15 @@ class ESIMAccess:
         self.cache[key] = (time.time(), plans)
         return plans
     def balance(self): return int(self.post("/balance/query", {})["balance"])
+    def package_identifier(self, plan):
+        # Use the supplier's exact catalog code, as in its documented order example.
+        # Do not invent a code from the storefront slug or silently select another package.
+        code = plan.get("package_code")
+        if not isinstance(code, str) or not code.strip(): raise ProviderUnavailable("missing_package_code")
+        return {"packageCode": code}
     def order(self, transaction_id, plan):
         obj = self.post("/esim/order", {"transactionId": transaction_id, "amount": plan["cost_units"],
-            "packageInfoList": [{"slug": plan["id"], "count": 1, "price": plan["cost_units"]}]})
+            "packageInfoList": [{**self.package_identifier(plan), "count": 1, "price": plan["cost_units"]}]})
         if not obj.get("orderNo"): raise ProviderUnavailable("missing_provider_order")
         if obj.get("transactionId") not in (None, transaction_id): raise ProviderUnavailable("provider_transaction_mismatch")
         return str(obj["orderNo"])
@@ -522,7 +529,7 @@ class ESIMAccess:
         return p
     def topup(self, transaction_id, plan, profile_id):
         obj = self.post("/esim/topup", {"transactionId": transaction_id, "esimTranNo": profile_id,
-            "slug": plan["id"], "amount": str(plan["cost_units"])})
+            **self.package_identifier(plan), "amount": str(plan["cost_units"])})
         if obj.get("transactionId") != transaction_id: raise ProviderUnavailable("provider_transaction_mismatch")
         return obj
     def usage(self, profile_id):
