@@ -640,7 +640,7 @@ def preflight_failure_code(stage, exc):
     return f"{stage}_unavailable"
 
 
-DISCOVERY_REVISION = "20260930-discovery15"
+DISCOVERY_REVISION = "20260930-doctor16"
 RESOURCE_DESCRIPTION = (
     "CryptoEsim: buy a travel eSIM or compatible data top-up with Algorand USDC; "
     "retrieve delivery and a signed receipt using the same private order."
@@ -687,11 +687,14 @@ def discovery_extensions(cfg):
         },
         "x402-merchant": {
             "info": {"name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION,
-                     "url": cfg.website_url, "website": cfg.website_url},
+                     "url": cfg.website_url, "website": cfg.website_url,
+                     "logo": cfg.public_url + "/brand.svg", "categories": ["travel", "connectivity"]},
             "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
                        "properties": {"name": {"type": "string"}, "description": {"type": "string"},
                                       "url": {"type": "string", "format": "uri"},
-                                      "website": {"type": "string", "format": "uri"}}, "required": ["name"]},
+                                      "website": {"type": "string", "format": "uri"},
+                                      "logo": {"type": "string", "format": "uri"},
+                                      "categories": {"type": "array", "items": {"type": "string"}}}, "required": ["name"]},
         },
     }
 
@@ -730,13 +733,16 @@ def inspect_avm_payload(payload, requirement, resource_url, mode):
         if payload.get("x402Version") != 2:
             raise InvalidPayment("unsupported_payment_version")
         accepted = payload["accepted"]
-        for field in ("scheme", "network", "asset", "amount", "payTo"):
+        for field in ("scheme", "asset", "amount", "payTo"):
             if str(accepted.get(field)) != str(requirement[field]):
                 raise InvalidPayment("payment_terms_mismatch")
+        aliases = {NETWORKS[mode], "algorand:" + GENESIS[mode]}
+        if accepted.get("network") not in aliases or requirement.get("network") not in aliases:
+            raise InvalidPayment("payment_network_mismatch")
         if payload.get("resource", {}).get("url") != resource_url:
             raise InvalidPayment("payment_resource_mismatch")
         group, index = payload["payload"]["paymentGroup"], payload["payload"]["paymentIndex"]
-        if not isinstance(group, list) or len(group) != 1 or type(index) is not int or not 0 <= index < len(group):
+        if not isinstance(group, list) or len(group) not in (1, 2) or type(index) is not int or not 0 <= index < len(group):
             raise InvalidPayment("invalid_payment_group")
         signed = encoding.msgpack_decode(group[index])
         if not isinstance(signed, transaction.SignedTransaction) or not signed.signature:
@@ -754,6 +760,34 @@ def inspect_avm_payload(payload, requirement, resource_url, mode):
             raise InvalidPayment("unsafe_transfer_fields")
         if txn.fee > 10000:
             raise InvalidPayment("unexpected_transaction_fee")
+        if len(group) == 1:
+            if txn.group or txn.fee < 1000:
+                raise InvalidPayment("incomplete_or_unfunded_payment_group")
+        else:
+            sponsor = requirement.get("extra", {}).get("feePayer")
+            if not sponsor or not encoding.is_valid_address(sponsor):
+                raise InvalidPayment("fee_sponsorship_not_offered")
+            decoded = encoding.msgpack_decode(group[1 - index])
+            # Accept raw unsigned transactions and the unsigned SignedTxn
+            # envelope used by some AVM clients. No buyer-supplied sponsor sig.
+            if isinstance(decoded, transaction.SignedTransaction) and not decoded.signature:
+                decoded = decoded.transaction
+            if not isinstance(decoded, transaction.PaymentTxn):
+                raise InvalidPayment("unsigned_sponsor_payment_required")
+            if (decoded.sender != sponsor or decoded.receiver != sponsor or decoded.amt != 0
+                    or decoded.rekey_to or decoded.close_remainder_to or decoded.lease
+                    or decoded.genesis_hash != GENESIS[mode]
+                    or decoded.first_valid_round != txn.first_valid_round
+                    or decoded.last_valid_round != txn.last_valid_round
+                    or not 2000 <= decoded.fee <= 10000 or txn.fee != 0):
+                raise InvalidPayment("unsafe_sponsor_transaction")
+            if not txn.group or decoded.group != txn.group:
+                raise InvalidPayment("payment_group_mismatch")
+            transactions = [txn, decoded] if index == 0 else [decoded, txn]
+            unsigned = [copy.deepcopy(t) for t in transactions]
+            for t in unsigned: t.group = None
+            if transaction.calculate_group_id(unsigned) != txn.group:
+                raise InvalidPayment("payment_group_mismatch")
         return PaymentIdentity(txn.get_txid(), txn.sender, txn.last_valid_round)
     except InvalidPayment:
         raise
@@ -766,7 +800,36 @@ class LiveGateway:
         self.settings = settings
         self.http = httpx.Client(timeout=settings.request_timeout, follow_redirects=False)
         self._facilitator_network = None
+        self._facilitator_extra = {}
         self._network_checked_at = 0.0
+        self._supported_lock = threading.Lock()
+
+    def capabilities(self):
+        """Advertise the network and optional sponsor actually returned by /supported."""
+        with self._supported_lock:
+            if self._facilitator_network is None or time.monotonic() - self._network_checked_at > 600:
+                try:
+                    response = self.http.get(self.settings.facilitator_url.rstrip("/") + "/supported")
+                    response.raise_for_status()
+                    kinds = response.json().get("kinds", [])
+                    # Prefer the facilitator's full-genesis alias when available.
+                    aliases = ("algorand:" + GENESIS[self.settings.mode], self.settings.network)
+                    kind = next((k for network in aliases for k in kinds if isinstance(k, dict)
+                                 and k.get("x402Version") == 2 and k.get("scheme") == "exact"
+                                 and k.get("network") == network), None)
+                    if kind is None: raise PaymentUnavailable("facilitator_network_not_supported")
+                    extra = kind.get("extra") or {}
+                    fee_payer = extra.get("feePayer") if isinstance(extra, dict) else None
+                    if fee_payer and (not isinstance(fee_payer, str) or not encoding.is_valid_address(fee_payer)):
+                        raise ValueError("invalid_facilitator_fee_payer")
+                    self._facilitator_network = kind["network"]
+                    self._facilitator_extra = {"feePayer": fee_payer} if fee_payer else {}
+                    self._network_checked_at = time.monotonic()
+                except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+                    failure = PaymentUnavailable("facilitator_supported_unavailable")
+                    failure.stage = "facilitator_supported"
+                    raise failure from exc
+            return {"network": self._facilitator_network, "extra": dict(self._facilitator_extra)}
 
     def inspect(self, payload, requirements, url):
         return inspect_avm_payload(payload, requirements, url, self.settings.mode)
@@ -774,20 +837,9 @@ class LiveGateway:
     def _post(self, endpoint, payload, requirements):
         stage = "facilitator_" + endpoint.strip("/")
         try:
-            # Current SDK uses CAIP-2 (32 chars). Some facilitators still register
-            # the full genesis hash. Negotiate only these two equivalent aliases;
-            # never change signed bytes, amount, asset, destination or resource.
-            if self._facilitator_network is None or time.monotonic() - self._network_checked_at > 600:
-                stage = "facilitator_supported"
-                supported = self.http.get(self.settings.facilitator_url.rstrip("/") + "/supported")
-                supported.raise_for_status()
-                networks = {kind.get("network") for kind in supported.json().get("kinds", [])
-                            if kind.get("scheme") == "exact" and kind.get("x402Version") == 2}
-                aliases = (self.settings.network, "algorand:" + GENESIS[self.settings.mode])
-                network = next((value for value in aliases if value in networks), None)
-                if network is None: raise PaymentUnavailable("facilitator_network_not_supported")
-                self._facilitator_network = network
-                self._network_checked_at = time.monotonic()
+            # Only wrapper aliases are normalized; signed bytes never change.
+            stage = "facilitator_supported"
+            self.capabilities()
             stage = "facilitator_" + endpoint.strip("/")
             outgoing_requirements = {**requirements, "network": self._facilitator_network}
             # Attach authoritative discovery metadata even for older/API clients
@@ -907,6 +959,16 @@ class Service:
         self._discovery_preview = None
         self._discovery_checked = 0.0
 
+    def payment_terms(self, amount):
+        terms = {"scheme": "exact", "network": self.cfg.network, "asset": self.cfg.asset,
+                 "amount": str(amount), "payTo": self.cfg.pay_to, "maxTimeoutSeconds": self.cfg.quote_ttl,
+                 "extra": {"decimals": 6, **({"tag": "x402-global-challenge"} if self.cfg.mode == "mainnet" else {})}}
+        if self.cfg.mode != "demo":
+            support = self.gateway.capabilities()
+            terms["network"] = support["network"]
+            terms["extra"].update(support["extra"])
+        return terms
+
     def public_challenge(self):
         """Read-only discovery. A catalog price is not an authorized order quote.
 
@@ -934,12 +996,13 @@ class Service:
         preview = self._discovery_preview
         accepts = []
         if preview:
-            accepts = [{"scheme": "exact", "network": cfg.network, "asset": cfg.asset,
-                        "amount": preview["amount"], "payTo": cfg.pay_to,
-                        "maxTimeoutSeconds": cfg.quote_ttl,
-                        "extra": {"decimals": 6, "quoteRequired": True,
-                                  "planId": preview["plan_id"], "country": preview["country"],
-                                  **({"tag": "x402-global-challenge"} if cfg.mode == "mainnet" else {})}}]
+            try:
+                terms = self.payment_terms(preview["amount"])
+                terms["extra"].update(quoteRequired=True, planId=preview["plan_id"], country=preview["country"])
+                accepts = [terms]
+            except PaymentUnavailable:
+                # Do not invent a sponsor or advertise an unverified network.
+                pass
         return {"x402Version": 2,
                 "error": "order_required: create an order and use its authenticated payment quote before signing",
                 "resource": {"url": cfg.public_url + "/api/pay", "description": RESOURCE_DESCRIPTION,
@@ -952,6 +1015,7 @@ class Service:
                 "pricing": "Catalog reference for the named package only; not a quote for every eSIM. "
                            "Use POST /api/orders, keep its recovery token, and pay only its exact 402 quote.",
                 "catalog_preview": preview,
+                "payment_support": "available" if accepts else "unavailable",
                 "catalog_status": "available" if preview else "no_price_available"}
 
     def authorize(self, row, token):
@@ -1001,9 +1065,7 @@ class Service:
         if not price: raise HTTPException(409, "No podemos ofrecer un precio competitivo con el margen configurado")
         if self.provider.balance() < plan["cost_units"]: raise HTTPException(503, "No hay saldo suficiente para emitir esta eSIM; no se ha cobrado")
         cfg = self.cfg
-        terms = {"scheme": "exact", "network": cfg.network, "asset": cfg.asset, "amount": price["amount_atomic"],
-                 "payTo": cfg.pay_to, "maxTimeoutSeconds": cfg.quote_ttl,
-                 "extra": {"decimals": 6, **({"tag": "x402-global-challenge"} if cfg.mode == "mainnet" else {})}}
+        terms = self.payment_terms(price["amount_atomic"])
         quote = {"plan": plan, "pricing": price, "terms": terms, "resource_url": cfg.public_url + "/api/pay"}
         values = {"id": oid, "token_hash": token_hash(token), "request_hash": digest(params), "request_json": canonical(params),
                   "quote_json": canonical(quote), "status": "quoted", "mode": cfg.mode, "created_ms": now_ms(),
@@ -1317,6 +1379,7 @@ from sqlalchemy import text
 
 ROOT = Path(__file__).parent
 WEB = ROOT.parent / "cryptoesim-storefront"
+PAYMENT_EXPOSE_HEADERS = ["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-Order-ID", "X-Recovery-Token", "X-Replayed", "Retry-After"]
 
 
 class OrderInput(BaseModel):
@@ -1371,6 +1434,9 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
                 if len(body) > 32768: return JSONResponse({"detail": "Petición demasiado grande"}, 413)
             request._body = bytes(body)
         response = await call_next(request)
+        # Publish the declaration even without Origin (e.g. Doctor/curl).
+        # CORSMiddleware still enforces the configured storefront origin.
+        response.headers["Access-Control-Expose-Headers"] = ", ".join(PAYMENT_EXPOSE_HEADERS)
         response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
             "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
             "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https: wss:; frame-src https:; object-src 'none'; base-uri 'none'; form-action 'self'"})
@@ -1384,6 +1450,10 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
 
     @app.exception_handler(ProviderUnavailable)
     async def unavailable(_, exc): return JSONResponse({"detail": "El proveedor no está disponible. Conserva tu pedido y reintenta la consulta."}, 503)
+    @app.exception_handler(PaymentUnavailable)
+    async def payment_unavailable(_, exc):
+        return JSONResponse({"detail": "El facilitador no está disponible. Conserva tu pedido y consulta su estado antes de reintentar.",
+                             "code": "facilitator_unavailable", "next_action": "recover_same_order"}, 503)
     @app.exception_handler(ProviderRejected)
     async def rejected(_, exc): return JSONResponse({"detail": "El proveedor no ha aceptado la consulta", "code": exc.code}, 503)
 
@@ -1418,6 +1488,7 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
 <meta name="application-name" content="{name}"><meta name="description" content="{description}">
 <meta property="og:site_name" content="{name}"><meta property="og:title" content="{name}">
 <meta property="og:description" content="{description}"><meta property="og:type" content="website">
+<meta property="og:image" content="{api}/brand.svg">
 <meta property="og:url" content="{storefront}/"><link rel="canonical" href="{storefront}/">
 <script type="application/ld+json">{structured_site}</script>
 <link rel="describedby" type="application/json" href="{api}/.well-known/x402.json">
@@ -1427,7 +1498,25 @@ h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style>
 <p><a href="/.well-known/x402.json">API discovery</a> · <a href="/health">Service health</a></p></body></html>''')
     @app.get("/.well-known/x402.json")
     @app.get("/.well-known/x402", include_in_schema=False)
-    def discovery(): return discovery_document(cfg)
+    def discovery():
+        value = discovery_document(cfg)
+        if cfg.mode != "demo":
+            try:
+                support = gateway.capabilities()
+                value["payment"]["network"] = support["network"]
+                value["payment"]["extra"].update(support["extra"])
+            except PaymentUnavailable:
+                value["payment"]["support_status"] = "temporarily_unavailable"
+        return value
+    @app.get("/brand.svg", include_in_schema=False)
+    def brand_logo():
+        return Response('''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="CryptoEsim">
+<rect width="128" height="128" rx="24" fill="#100c0d"/>
+<path d="M40 18h35l21 21v71H32V26a8 8 0 0 1 8-8Z" fill="#ef334f"/>
+<g transform="translate(40 48)" stroke="#fff" stroke-width="2" fill="none">
+<rect x="1" y="1" width="46" height="38" rx="7"/>
+<path d="M16 1v12H1m46 0H32V1M16 39V28H1m46 0H32v11M16 13h16v15H16Z"/>
+</g></svg>''', media_type="image/svg+xml")
     @app.get("/llms.txt", include_in_schema=False)
     def agent_guide():
         return Response(
@@ -1622,7 +1711,7 @@ h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style>
         return {"status": "refunded", "transaction": txid}
 
     if WEB.is_dir(): app.mount("/", StaticFiles(directory=WEB), name="storefront")
-    app.add_middleware(CORSMiddleware, allow_origins=[cfg.store_origin] if cfg.store_origin else [], allow_credentials=False, allow_methods=["GET", "POST"], allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Recovery-Token", "X-Parent-Token", "PAYMENT-SIGNATURE"], expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-Order-ID", "X-Recovery-Token", "X-Replayed", "Retry-After"])
+    app.add_middleware(CORSMiddleware, allow_origins=[cfg.store_origin] if cfg.store_origin else [], allow_credentials=False, allow_methods=["GET", "POST"], allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Recovery-Token", "X-Parent-Token", "PAYMENT-SIGNATURE"], expose_headers=PAYMENT_EXPOSE_HEADERS)
     return app
 
 
