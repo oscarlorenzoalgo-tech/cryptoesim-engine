@@ -640,7 +640,7 @@ def preflight_failure_code(stage, exc):
     return f"{stage}_unavailable"
 
 
-DISCOVERY_REVISION = "20260930-merchant-site14"
+DISCOVERY_REVISION = "20260930-discovery15"
 RESOURCE_DESCRIPTION = (
     "CryptoEsim: buy a travel eSIM or compatible data top-up with Algorand USDC; "
     "retrieve delivery and a signed receipt using the same private order."
@@ -686,10 +686,12 @@ def discovery_extensions(cfg):
             },
         },
         "x402-merchant": {
-            "info": {"name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "url": cfg.website_url},
+            "info": {"name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION,
+                     "url": cfg.website_url, "website": cfg.website_url},
             "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
                        "properties": {"name": {"type": "string"}, "description": {"type": "string"},
-                                      "url": {"type": "string"}}, "required": ["name"]},
+                                      "url": {"type": "string", "format": "uri"},
+                                      "website": {"type": "string", "format": "uri"}}, "required": ["name"]},
         },
     }
 
@@ -901,6 +903,56 @@ class Service:
     def __init__(self, cfg, store, provider, gateway):
         self.cfg, self.store, self.provider, self.gateway = cfg, store, provider, gateway
         self.vault = Vault(cfg); self.signer = ReceiptSigner(cfg); self.pricing = Pricing(cfg)
+        self._discovery_lock = threading.Lock()
+        self._discovery_preview = None
+        self._discovery_checked = 0.0
+
+    def public_challenge(self):
+        """Read-only discovery. A catalog price is not an authorized order quote.
+
+        Never create an order or call verify/settle here. A client must first
+        obtain its own order and sign the exact authenticated order challenge.
+        Do not invent a fallback price when the supplier catalog is unavailable.
+        """
+        cfg = self.cfg
+        if self._discovery_checked == 0 or time.monotonic() - self._discovery_checked >= 60:
+            with self._discovery_lock:
+                if self._discovery_checked == 0 or time.monotonic() - self._discovery_checked >= 60:
+                    preview = None
+                    if cfg.mode != "mainnet" or cfg.sales_enabled:
+                        country = cfg.allowed_countries[0]
+                        try:
+                            items = self.catalog(country)
+                            if items:
+                                item = items[0]
+                                preview = {"country": country, "plan_id": item["plan"]["id"],
+                                           "amount": item["pricing"]["amount_atomic"]}
+                        except (ProviderUnavailable, ProviderRejected, httpx.HTTPError, ValueError, KeyError, TypeError):
+                            pass
+                    self._discovery_preview = preview
+                    self._discovery_checked = time.monotonic()
+        preview = self._discovery_preview
+        accepts = []
+        if preview:
+            accepts = [{"scheme": "exact", "network": cfg.network, "asset": cfg.asset,
+                        "amount": preview["amount"], "payTo": cfg.pay_to,
+                        "maxTimeoutSeconds": cfg.quote_ttl,
+                        "extra": {"decimals": 6, "quoteRequired": True,
+                                  "planId": preview["plan_id"], "country": preview["country"],
+                                  **({"tag": "x402-global-challenge"} if cfg.mode == "mainnet" else {})}}]
+        return {"x402Version": 2,
+                "error": "order_required: create an order and use its authenticated payment quote before signing",
+                "resource": {"url": cfg.public_url + "/api/pay", "description": RESOURCE_DESCRIPTION,
+                             "mimeType": "application/json"},
+                "accepts": accepts, "extensions": discovery_extensions(cfg),
+                "website": cfg.website_url, "revision": DISCOVERY_REVISION,
+                "quote_required": True, "payment_submitted": False,
+                "next_action": "create_order", "catalog_url": cfg.public_url + "/api/plans",
+                "create_order_url": cfg.public_url + "/api/orders",
+                "pricing": "Catalog reference for the named package only; not a quote for every eSIM. "
+                           "Use POST /api/orders, keep its recovery token, and pay only its exact 402 quote.",
+                "catalog_preview": preview,
+                "catalog_status": "available" if preview else "no_price_available"}
 
     def authorize(self, row, token):
         if not row or not token or not hmac.compare_digest(row["token_hash"], token_hash(token)):
@@ -1257,6 +1309,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 from sqlalchemy import text
@@ -1373,7 +1426,25 @@ h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style>
 <body><h1>{name}</h1><p>{description}</p><p>Official website: <a href="{storefront}/" rel="home">{site_label}</a></p>
 <p><a href="/.well-known/x402.json">API discovery</a> · <a href="/health">Service health</a></p></body></html>''')
     @app.get("/.well-known/x402.json")
+    @app.get("/.well-known/x402", include_in_schema=False)
     def discovery(): return discovery_document(cfg)
+    @app.get("/llms.txt", include_in_schema=False)
+    def agent_guide():
+        return Response(
+            f"# {cfg.merchant_name}\n\n{RESOURCE_DESCRIPTION}\n\n"
+            f"Official website: {cfg.website_url}/\n"
+            f"API origin: {cfg.public_url}\n"
+            f"Discovery: {cfg.public_url}/.well-known/x402.json\n"
+            f"Merchant payment address: {cfg.pay_to}\nNetwork: {cfg.network}\nUSDC asset: {cfg.asset}\n\n"
+            "1. Read GET /api/plans?country=ES for current packages and prices.\n"
+            "2. After device compatibility and terms acceptance, POST /api/orders with the selected plan.\n"
+            "3. Keep the order ID and recovery token private. Use the order-specific 402 quote.\n"
+            "4. POST /api/pay with {\"order_id\":\"YOUR_ORDER_UUID\"}, Authorization: Bearer YOUR_RECOVERY_TOKEN, "
+            "and PAYMENT-SIGNATURE containing the signed x402 payload.\n"
+            "5. Recover that same order via GET /api/orders/{order_id}; do not pay again to check delivery.\n\n"
+            "A bodyless POST /api/pay returns a public 402 discovery response. Its catalog reference "
+            "is not an authorized purchase quote. Create your own order before signing any payment.\n",
+            media_type="text/plain")
     @app.get("/docs")
     def api_docs(): return {"paid_resource": cfg.public_url + "/api/pay", "catalog": "/api/plans", "orders": "/api/orders"}
     @app.get("/health")
@@ -1411,11 +1482,26 @@ h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style>
         response = order_response(row, True); response.headers["X-Replayed"] = str(was_completed).lower()
         return response
     @app.post("/api/pay")
-    def pay_resource(body: dict, request: Request):
+    async def pay_resource(request: Request):
         # A stable resource URL keeps discovery and leaderboard records together.
-        oid = body.get("order_id")
-        if not isinstance(oid, str): raise HTTPException(400, "Crea un pedido en /api/orders e indica order_id")
-        return pay(oid, request)
+        # Parse manually so FastAPI does not emit 400/422 before an unpaid
+        # discovery probe can receive its 402. Authenticated purchases still
+        # follow exactly the same ownership, amount and settlement checks.
+        raw_payment = request.headers.get("PAYMENT-SIGNATURE")
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        oid = body.get("order_id") if isinstance(body, dict) else None
+        if not raw_payment and (not isinstance(oid, str) or not oid or not token(request)):
+            value = await run_in_threadpool(service.public_challenge)
+            return JSONResponse(value, 402, headers={
+                "PAYMENT-REQUIRED": encode_header(value),
+                "Link": f'<{cfg.website_url}/>; rel="home", <{cfg.public_url}/.well-known/x402.json>; rel="describedby"',
+            })
+        if not isinstance(oid, str) or not oid:
+            raise HTTPException(400, "Crea un pedido en /api/orders e indica order_id; no se ha enviado el pago")
+        return await run_in_threadpool(pay, oid, request)
     @app.get("/api/orders/{oid}")
     def get_order(oid: str, request: Request): return order_response(own(oid, request))
     @app.get("/api/orders/{oid}/diagnostics")
