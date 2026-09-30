@@ -62,6 +62,8 @@ class Settings:
     def history_url(self): return self.indexer_url or f"https://{self.mode}-idx.algonode.cloud"
     @property
     def simulation(self): return self.mode != "mainnet"
+    @property
+    def website_url(self): return (self.store_origin or self.public_url).rstrip("/")
 
     def validate(self):
         from decimal import Decimal
@@ -638,7 +640,7 @@ def preflight_failure_code(stage, exc):
     return f"{stage}_unavailable"
 
 
-DISCOVERY_REVISION = "20260929-bazaar11"
+DISCOVERY_REVISION = "20260930-merchant-site14"
 RESOURCE_DESCRIPTION = (
     "CryptoEsim: buy a travel eSIM or compatible data top-up with Algorand USDC; "
     "retrieve delivery and a signed receipt using the same private order."
@@ -684,7 +686,7 @@ def discovery_extensions(cfg):
             },
         },
         "x402-merchant": {
-            "info": {"name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "url": cfg.public_url},
+            "info": {"name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "url": cfg.website_url},
             "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
                        "properties": {"name": {"type": "string"}, "description": {"type": "string"},
                                       "url": {"type": "string"}}, "required": ["name"]},
@@ -695,7 +697,8 @@ def discovery_extensions(cfg):
 def discovery_document(cfg):
     """Public description, NOT a payable quote: prices depend on the selected plan."""
     return {
-        "name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "url": cfg.public_url,
+        "name": cfg.merchant_name, "description": RESOURCE_DESCRIPTION, "url": cfg.website_url,
+        "website": cfg.website_url,
         "x402Version": 2, "revision": DISCOVERY_REVISION,
         "resource": {"url": cfg.public_url + "/api/pay", "description": RESOURCE_DESCRIPTION,
                      "mimeType": "application/json"},
@@ -1349,19 +1352,25 @@ def create_app(cfg=None, store=None, provider=None, gateway=None):
     def home(request: Request):
         if (WEB / "cryptoesim.html").is_file(): return FileResponse(WEB / "cryptoesim.html")
         if "application/json" in request.headers.get("Accept", ""):
-            return {"service": "CryptoEsim API", "health": "/health", "discovery": "/.well-known/x402.json"}
+            return {"service": "CryptoEsim API", "website": cfg.website_url,
+                    "health": "/health", "discovery": "/.well-known/x402.json"}
         name, description = escape(cfg.merchant_name), escape(RESOURCE_DESCRIPTION)
-        api, storefront = escape(cfg.public_url, quote=True), escape(cfg.store_origin or cfg.public_url, quote=True)
+        api, storefront = escape(cfg.public_url, quote=True), escape(cfg.website_url, quote=True)
+        site_label = escape(urlparse(cfg.website_url).netloc)
+        structured_site = json.dumps({"@context": "https://schema.org", "@type": "WebSite",
+            "name": cfg.merchant_name, "url": cfg.website_url,
+            "description": RESOURCE_DESCRIPTION}, ensure_ascii=True).replace("<", "\\u003c")
         return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{name}</title>
 <meta name="application-name" content="{name}"><meta name="description" content="{description}">
 <meta property="og:site_name" content="{name}"><meta property="og:title" content="{name}">
 <meta property="og:description" content="{description}"><meta property="og:type" content="website">
-<meta property="og:url" content="{api}/"><link rel="canonical" href="{api}/">
+<meta property="og:url" content="{storefront}/"><link rel="canonical" href="{storefront}/">
+<script type="application/ld+json">{structured_site}</script>
 <link rel="describedby" type="application/json" href="{api}/.well-known/x402.json">
 <style>body{{background:#100e11;color:#f8f6f7;font:18px system-ui;margin:10vh auto;padding:24px;max-width:720px}}
 h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style></head>
-<body><h1>{name}</h1><p>{description}</p><p><a href="{storefront}">Open CryptoEsim store</a></p>
+<body><h1>{name}</h1><p>{description}</p><p>Official website: <a href="{storefront}/" rel="home">{site_label}</a></p>
 <p><a href="/.well-known/x402.json">API discovery</a> · <a href="/health">Service health</a></p></body></html>''')
     @app.get("/.well-known/x402.json")
     def discovery(): return discovery_document(cfg)
@@ -1376,6 +1385,7 @@ h1{{color:#ff465a;font-size:48px}}a{{color:#ff8290}}p{{line-height:1.6}}</style>
     @app.get("/api/config")
     def config():
         return {"mode": cfg.mode, "network": cfg.network, "asset": cfg.asset, "pay_to": cfg.pay_to, "public_url": cfg.public_url,
+                "website_url": cfg.website_url,
                 "simulation": cfg.simulation, "sales_enabled": cfg.mode != "mainnet" or cfg.sales_enabled,
                 "countries": cfg.allowed_countries, "merchant_name": cfg.merchant_name, "support_email": cfg.support_email,
                 "algod_url": cfg.node_url if cfg.mode != "demo" else None, "signing_key": service.signer.public_document(),
